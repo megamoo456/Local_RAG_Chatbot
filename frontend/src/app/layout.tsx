@@ -17,21 +17,15 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en" suppressHydrationWarning>
-      <body className={inter.className}>
+      <body className={`${inter.className} h-screen min-h-screen`}>
         <ThemeProvider
           attribute="class"
           defaultTheme="dark"
           enableSystem
           disableTransitionOnChange
         >
-          <div className="flex h-screen bg-background">
-            {/* Sidebar will go here in Phase 5 */}
-            <div className="hidden w-64 border-r bg-muted/20 md:block">
-              <div className="p-4 font-semibold">Local RAG Chatbot</div>
-            </div>
-            
-            {/* Main content */}
-            <main className="flex-1 flex flex-col min-w-0">
+          <div className="flex h-screen min-h-screen overflow-hidden bg-background">
+            <main className="flex-1 flex flex-col min-w-0 min-h-0 overflow-hidden">
               {children}
             </main>
           </div>

@@ -33,7 +33,9 @@ async def chat(request: ChatRequest) -> ChatResponse:
         result = await chat_service.chat(
             message=request.message,
             conversation_id=conversation_id,
+            document_ids=request.document_ids,
             use_rag=request.use_rag,
+            use_internet=request.use_internet,
         )
 
         return ChatResponse(**result)

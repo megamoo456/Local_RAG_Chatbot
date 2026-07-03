@@ -81,7 +81,7 @@ format: ## Format backend code
 # ------------------------------------------------------------------------------
 
 pull-model: ## Pull the default LLM model
-	docker compose exec ollama ollama pull qwen3.5:9b
+	docker compose exec ollama ollama pull qwen3.5:9b-q4_K_M
 
 list-models: ## List available Ollama models
 	docker compose exec ollama ollama list
