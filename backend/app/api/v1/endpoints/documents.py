@@ -12,7 +12,9 @@ from app.core.config import get_settings
 from app.core.dependencies import get_current_user
 from app.core.database import get_session
 from app.models.user import User
+from app.models.document import DocumentStatus
 from app.repositories.document_repository import DocumentRepository
+from app.services.document_processor import DocumentProcessor
 from app.schemas.document import (
     DocumentUploadResponse,
     DocumentListResponse,
@@ -20,6 +22,7 @@ from app.schemas.document import (
 )
 
 router = APIRouter(prefix="/documents", tags=["documents"])
+document_processor = DocumentProcessor()
 
 
 @router.post("/upload", response_model=DocumentUploadResponse, status_code=status.HTTP_201_CREATED)
@@ -81,6 +84,41 @@ async def upload_document(
         file_size=file_size,
     )
     
+    # Process document asynchronously
+    try:
+        chunk_count, error_message = document_processor.process_document(
+            document_id=document.id,
+            file_path=str(file_path),
+            file_type=file_ext,
+            filename=file.filename,
+        )
+        
+        if error_message:
+            await repo.update_document_status(
+                document_id=document.id,
+                status=DocumentStatus.FAILED,
+                error_message=error_message,
+            )
+        else:
+            await repo.update_document_status(
+                document_id=document.id,
+                status=DocumentStatus.COMPLETED,
+                chunk_count=chunk_count,
+            )
+        
+        # Refresh document to get updated status
+        await session.commit()
+    except Exception as e:
+        error_msg = f"Error during processing: {str(e)}"
+        await repo.update_document_status(
+            document_id=document.id,
+            status=DocumentStatus.FAILED,
+            error_message=error_msg,
+        )
+        await session.commit()
+    
+    # Refresh document for response
+    document = await repo.get_document(document.id, current_user.id)
     return DocumentUploadResponse.model_validate(document)
 
 
@@ -141,3 +179,8 @@ async def delete_document(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Document not found",
         )
+    
+    # Also delete chunks from Qdrant
+    document_processor.delete_document_chunks(document_id)
+    
+    await session.commit()

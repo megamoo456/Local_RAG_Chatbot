@@ -1,15 +1,16 @@
 "use client";
 
 import { useState, useRef, useEffect } from "react";
-import { Send, Bot, User, Sparkles, AlertCircle, Menu, Settings, Plus, File, X } from "lucide-react";
+import { Send, Bot, User, Sparkles, AlertCircle, Menu, Settings, Plus, File, X, Brain } from "lucide-react";
 import ConversationSidebar from "@/components/ConversationSidebar";
 import FileUploadButton from "@/components/FileUploadButton";
 import SettingsModal from "@/components/SettingsModal";
 
 type Message = {
   id: string;
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "system";
   content: string;
+  thoughts?: string;
 };
 
 type UploadedFile = {
@@ -29,6 +30,14 @@ export default function ChatPage() {
   ]);
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
+  const [showThoughts, setShowThoughts] = useState(false);
+  const [isThinking, setIsThinking] = useState(false);
+  const [currentThoughts, setCurrentThoughts] = useState("");
+  const [memoryModalOpen, setMemoryModalOpen] = useState(false);
+  const [memoryInput, setMemoryInput] = useState("");
+  const [personaToggle, setPersonaToggle] = useState(false);
+  const [personaModalOpen, setPersonaModalOpen] = useState(false);
+  const [personaInput, setPersonaInput] = useState("");
   const [healthStatus, setHealthStatus] = useState<"healthy" | "error" | "checking">("checking");
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -54,6 +63,61 @@ export default function ChatPage() {
     };
     checkHealth();
   }, []);
+  
+    useEffect(() => {
+    const savedFiles = localStorage.getItem('rag_uploaded_files');
+    if (savedFiles) {
+      try {
+        const parsedFiles = JSON.parse(savedFiles);
+        
+        // Only keep valid file objects with required properties
+        const validFiles: UploadedFile[] = parsedFiles.filter((f: any) => 
+          f.id && typeof f.name === 'string' && typeof f.url === 'string'
+        );
+
+        if (validFiles.length > 0) {
+          setUploadedFiles(validFiles);
+          
+          // Add initial system message with file references for RAG context
+          const now = new Date().toISOString();
+          const initialMessage: Message = {
+            id: crypto.randomUUID(),
+            role: "system",
+            content: `RAG Context Files:\n- ${validFiles.map(f => f.name).join(', ')}\n\nThese files are available for RAG retrieval.`,
+            timestamp: now,
+          };
+
+          setMessages((prev) => [initialMessage, ...prev]);
+        } else {
+          localStorage.removeItem('rag_uploaded_files');
+        }
+      } catch (error) {
+        console.error("Failed to parse saved files:", error);
+        localStorage.removeItem('rag_uploaded_files');
+      }
+    }
+
+    // Save uploaded files whenever they change
+    if (uploadedFiles.length > 0) {
+      try {
+        const fileData = JSON.stringify(uploadedFiles.map(f => ({
+          id: f.id,
+          name: f.name,
+          url: f.url,
+          size: typeof f.size === 'number' ? f.size : undefined,
+          type: typeof f.type === 'string' ? f.type : undefined,
+        })));
+        
+        localStorage.setItem('rag_uploaded_files', fileData);
+      } catch (error) {
+        console.error("Failed to save uploaded files:", error);
+      }
+    } else if (!uploadedFiles.length && savedFiles !== null) {
+      // Clear storage when no files are being tracked anymore
+      localStorage.removeItem('rag_uploaded_files');
+    }
+
+  }, [uploadedFiles]);
 
   const handleSend = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -68,33 +132,79 @@ export default function ChatPage() {
     setMessages((prev) => [...prev, userMessage]);
     setInput("");
     setIsLoading(true);
+    setIsThinking(true); // Set thinking state
+    setCurrentThoughts(""); // Clear previous thoughts
 
     try {
       const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
-      const res = await fetch(`${apiUrl}/api/v1/chat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          message: userMessage.content,
-          conversation_id: currentConversationId,
-          document_ids: uploadedFiles.map(f => f.id),
-          use_rag: true,
-        }),
-      });
-
-      if (!res.ok) throw new Error('Failed to get response');
-
-      const data = await res.json();
-      const botResponse: Message = {
-        id: (Date.now() + 1).toString(),
-        role: "assistant",
-        content: data.response,
-      };
-      setMessages((prev) => [...prev, botResponse]);
       
-      // Update conversation ID if this was a new conversation
-      if (data.conversation_id && !currentConversationId) {
-        setCurrentConversationId(data.conversation_id);
+      if (showThoughts) {
+        // Use streaming endpoint to show thoughts while loading
+        const response = await fetch(`${apiUrl}/api/v1/chat/stream?message=${encodeURIComponent(userMessage.content)}&conversation_id=${currentConversationId || ''}&use_rag=true&use_persona=${personaToggle}`);
+        const reader = response.body?.getReader();
+        const decoder = new TextDecoder();
+        
+        let botMessage: Message = {
+          id: (Date.now() + 1).toString(),
+          role: "assistant",
+          content: "",
+          thoughts: "",
+        };
+
+        while (true) {
+          const { value, done } = await reader!.read();
+          if (done) break;
+          
+          const chunk = decoder.decode(value);
+          const lines = chunk.split('\n\n');
+          
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              const data = JSON.parse(line.slice(6));
+              if (data.type === 'thought') {
+                botMessage.thoughts = data.content;
+                setMessages((prev) => [...prev, { ...botMessage }]);
+              } else if (data.type === 'answer') {
+                botMessage.content = data.content;
+                setMessages((prev) => [...prev, { ...botMessage }]);
+              }
+            }
+          }
+        }
+        // Remove the temporary messages and add the final one
+        setMessages((prev) => {
+          const filtered = prev.filter(m => m.id !== botMessage.id);
+          return [...filtered, { ...botMessage }];
+        });
+      } else {
+        // Standard non-streaming request
+        const res = await fetch(`${apiUrl}/api/v1/chat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            message: userMessage.content,
+            conversation_id: currentConversationId,
+            document_ids: uploadedFiles.map(f => f.id),
+            use_rag: true,
+            use_persona: personaToggle,
+          }),
+        });
+
+        if (!res.ok) throw new Error('Failed to get response');
+
+        const data = await res.json();
+        const botResponse: Message = {
+          id: (Date.now() + 1).toString(),
+          role: "assistant",
+          content: data.response,
+          thoughts: data.thoughts,
+        };
+        setMessages((prev) => [...prev, botResponse]);
+        
+        // Update conversation ID if this was a new conversation
+        if (data.conversation_id && !currentConversationId) {
+          setCurrentConversationId(data.conversation_id);
+        }
       }
     } catch (error) {
       const botResponse: Message = {
@@ -105,6 +215,95 @@ export default function ChatPage() {
       setMessages((prev) => [...prev, botResponse]);
     } finally {
       setIsLoading(false);
+      setIsThinking(false); // End thinking state
+    }
+  };
+
+  const handleRefinePrompt = async () => {
+    if (!input.trim() || isLoading) return;
+    
+    setIsLoading(true);
+    try {
+      const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+      const res = await fetch(`${apiUrl}/api/v1/chat/refine?message=${encodeURIComponent(input)}`, {
+        method: 'POST',
+      });
+      if (!res.ok) throw new Error('Failed to refine prompt');
+      const data = await res.json();
+      setInput(data.refined_message);
+    } catch (error) {
+      console.error("Error refining prompt:", error);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleUpdateMemory = async () => {
+    if (!currentConversationId) {
+      alert("Please start a conversation first.");
+      return;
+    }
+    setMemoryModalOpen(true);
+  };
+
+  const closeMemoryModal = () => {
+    setMemoryModalOpen(false);
+    setMemoryInput("");
+  };
+
+  const saveMemory = async () => {
+    if (!memoryInput.trim()) return;
+    
+    setIsLoading(true);
+    try {
+      const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+      const res = await fetch(`${apiUrl}/api/v1/chat/memory?conversation_id=${currentConversationId}&memory=${encodeURIComponent(memoryInput)}`, {
+        method: 'POST',
+      });
+      if (res.ok) {
+        alert("Memory updated!");
+        closeMemoryModal();
+      }
+    } catch (error) {
+      console.error("Error updating memory:", error);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleOpenPersonaModal = () => {
+    // Load current persona if exists
+    const savedPersona = localStorage.getItem('userPersona') || '';
+    setPersonaInput(savedPersona);
+    setPersonaModalOpen(true);
+  };
+
+  const closePersonaModal = () => {
+    setPersonaModalOpen(false);
+  };
+
+  const savePersona = async () => {
+    if (!personaInput.trim()) {
+      // Clear persona if empty
+      localStorage.removeItem('userPersona');
+      setPersonaModalOpen(false);
+      setPersonaInput("");
+      return;
+    }
+    
+    try {
+      // Save to localStorage for persistence
+      localStorage.setItem('userPersona', personaInput);
+      
+      // TODO: Also save to backend if we had a user endpoint
+      // For now, we'll just use localStorage
+      
+      setPersonaModalOpen(false);
+      alert("Persona saved!");
+    } catch (error) {
+      console.error("Error saving persona:", error);
+    } finally {
+      setPersonaInput("");
     }
   };
 
@@ -206,6 +405,20 @@ export default function ChatPage() {
               <Plus className="w-5 h-5" />
             </button>
             <button
+              onClick={handleUpdateMemory}
+              className="p-2 hover:bg-accent rounded-lg transition-colors"
+              title="Add to Memory"
+            >
+              <Brain className="w-5 h-5" />
+            </button>
+            <button
+              onClick={handleOpenPersonaModal}
+              className="p-2 hover:bg-accent rounded-lg transition-colors"
+              title="Edit Persona"
+            >
+              <User className="w-5 h-5" />
+            </button>
+            <button
               onClick={() => setSettingsOpen(true)}
               className="p-2 hover:bg-accent rounded-lg transition-colors"
               title="Settings"
@@ -246,13 +459,44 @@ export default function ChatPage() {
                     : "bg-card text-card-foreground border rounded-tl-sm shadow-sm"
                 }`}
               >
+                {/* Show thinking state for the most recent assistant message if currently thinking */}
+                {message.role === "assistant" && isThinking && message.id === messages[messages.length - 1]?.id && (
+                  <div className="mb-3 p-3 bg-muted/50 rounded-lg text-xs italic text-muted-foreground border-l-2 border-primary/30">
+                    <div className="font-bold mb-1 flex items-center gap-1">
+                      <Bot className="w-3 h-3" /> AI Thought Process:
+                    </div>
+                    {currentThoughts || "Thinking..."}
+                  </div>
+                )}
+                
+                {/* Show thoughts if toggle is on and thoughts exist */}
+                {message.thoughts && showThoughts && !isThinking && (
+                  <div className="mb-3 p-3 bg-muted/50 rounded-lg text-xs italic text-muted-foreground border-l-2 border-primary/30">
+                    <div className="font-bold mb-1 flex items-center gap-1">
+                      <Bot className="w-3 h-3" /> AI Thought Process:
+                    </div>
+                    {message.thoughts}
+                  </div>
+                )}
                 <p className="whitespace-pre-wrap break-words">{message.content}</p>
               </div>
             </div>
           ))}
 
-          {/* Typing Indicator */}
-          {isLoading && (
+          {/* Thinking Indicator */}
+          {isLoading && isThinking && (
+            <div className="flex gap-4 flex-row animate-in fade-in duration-300">
+              <div className="flex-none w-8 h-8 sm:w-10 sm:h-10 rounded-full bg-primary text-primary-foreground flex items-center justify-center shadow-sm">
+                <Bot className="w-4 h-4 sm:w-5 sm:h-5" />
+              </div>
+              <div className="bg-card border px-5 py-4 rounded-2xl rounded-tl-sm shadow-sm flex items-center gap-1.5">
+                <span className="text-xs italic text-muted-foreground">AI is thinking...</span>
+              </div>
+            </div>
+          )}
+          
+          {/* Standard Loading Indicator (when not thinking) */}
+          {isLoading && !isThinking && (
             <div className="flex gap-4 flex-row animate-in fade-in duration-300">
               <div className="flex-none w-8 h-8 sm:w-10 sm:h-10 rounded-full bg-primary text-primary-foreground flex items-center justify-center shadow-sm">
                 <Bot className="w-4 h-4 sm:w-5 sm:h-5" />
@@ -315,11 +559,37 @@ export default function ChatPage() {
               placeholder="Ask me anything..."
               className="w-full max-h-[200px] min-h-[44px] bg-transparent resize-none outline-none py-3 px-4 text-[15px] placeholder:text-muted-foreground scrollbar-thin scrollbar-thumb-muted"
               rows={1}
+              onInput={(e) => {
+                const target = e.target as HTMLTextAreaElement;
+                target.style.height = 'auto';
+                target.style.height = `${target.scrollHeight}px`;
+              }}
             />
+            <div className="flex items-center gap-1 mb-1 mr-1">
+              <button
+                type="button"
+                onClick={handleRefinePrompt}
+                disabled={!input.trim() || isLoading}
+                className="p-2 rounded-lg bg-secondary text-secondary-foreground hover:bg-secondary/80 disabled:opacity-50 transition-colors"
+                title="Refine Prompt"
+              >
+                <Sparkles className="w-4 h-4" />
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowThoughts(!showThoughts)}
+                className={`p-2 rounded-lg transition-colors ${
+                  showThoughts ? "bg-primary text-primary-foreground" : "bg-secondary text-secondary-foreground"
+                }`}
+                title="Toggle AI Thoughts"
+              >
+                <div className="text-[10px] font-bold uppercase">Thoughts</div>
+              </button>
+            </div>
             <button
               type="submit"
               disabled={!input.trim() || isLoading}
-              className="flex-none w-10 h-10 mb-1 mr-1 rounded-xl bg-primary text-primary-foreground flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed hover:bg-primary/90 transition-colors shadow-sm active:scale-95"
+              className="flex-none w-10 h-10 mb-1 rounded-xl bg-primary text-primary-foreground flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed hover:bg-primary/90 transition-s-colors shadow-sm active:scale-95"
             >
               <Send className="w-4 h-4 ml-0.5" />
             </button>
@@ -331,12 +601,141 @@ export default function ChatPage() {
       </footer>
       </div>
 
+      {/* Memory Modal */}
+      {memoryModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-background/80 backdrop-blur-sm animate-in fade-in duration-200">
+          <div className="bg-card border rounded-2xl shadow-xl w-full max-w-md overflow-hidden animate-in zoom-in-95 duration-200">
+            <div className="p-6 border-b flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Brain className="w-5 h-5 text-primary" />
+                <h3 className="font-semibold">Add to Conversation Memory</h3>
+              </div>
+              <button onClick={closeMemoryModal} className="p-1 hover:bg-accent rounded-full transition-colors">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <div className="p-6">
+              <p className="text-sm text-muted-foreground mb-4">
+                Tell the AI something about you or your preferences that it should remember for this specific conversation.
+              </p>
+              <textarea
+                value={memoryInput}
+                onChange={(e) => setMemoryInput(e.target.value)}
+                placeholder="e.g., I prefer concise answers and I am a senior developer..."
+                className="w-full h-32 p-3 rounded-xl border bg-background outline-none focus:ring-2 focus:ring-primary/20 transition-all resize-none"
+              />
+            </div>
+            <div className="p-6 border-t flex justify-end gap-3">
+              <button
+                onClick={closeMemoryModal}
+                className="px-4 py-2 text-sm font-medium hover:bg-accent rounded-lg transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={saveMemory}
+                disabled={!memoryInput.trim() || isLoading}
+                className="px-4 py-2 text-sm font-medium bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 disabled:opacity-50 transition-colors"
+              >
+                Save Memory
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Persona Modal */}
+      {personaModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-background/80 backdrop-blur-sm animate-in fade-in duration-200">
+          <div className="bg-card border rounded-2xl shadow-xl w-full max-w-md overflow-hidden animate-in zoom-in-95 duration-200">
+            <div className="p-6 border-b flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <User className="w-5 h-5 text-primary" />
+                <h3 className="font-semibold">Edit Your Persona</h3>
+              </div>
+              <button onClick={closePersonaModal} className="p-1 hover:bg-accent rounded-full transition-colors">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <div className="p-6">
+              <p className="text-sm text-muted-foreground mb-4">
+                Describe yourself, your preferences, expertise, or anything that would help the AI provide more personalized responses.
+              </p>
+              <textarea
+                value={personaInput}
+                onChange={(e) => setPersonaInput(e.target.value)}
+                placeholder="e.g., I'm a senior software engineer who prefers concise, technical answers. I enjoy hiking and photography."
+                className="w-full h-32 p-3 rounded-xl border bg-background outline-none focus:ring-2 focus:ring-primary/20 transition-all resize-none"
+              />
+            </div>
+            <div className="p-6 border-t flex justify-end gap-3">
+              <button
+                onClick={closePersonaModal}
+                className="px-4 py-2 text-sm font-medium hover:bg-accent rounded-lg transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={savePersona}
+                disabled={isLoading}
+                className="px-4 py-2 text-sm font-medium bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 disabled:opacity-50 transition-colors"
+              >
+                Save Persona
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Settings Modal */}
       <SettingsModal
         isOpen={settingsOpen}
         onClose={() => setSettingsOpen(false)}
         apiUrl={process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}
       />
+
+      {/* Persona Modal */}
+      {personaModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-background/80 backdrop-blur-sm animate-in fade-in duration-200">
+          <div className="bg-card border rounded-2xl shadow-xl w-full max-w-md overflow-hidden animate-in zoom-in-95 duration-200">
+            <div className="p-6 border-b flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <User className="w-5 h-5 text-primary" />
+                <h3 className="font-semibold">Edit Your Persona</h3>
+              </div>
+              <button onClick={closePersonaModal} className="p-1 hover:bg-accent rounded-full transition-colors">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <div className="p-6">
+              <p className="text-sm text-muted-foreground mb-4">
+                Describe yourself, your preferences, expertise, or anything that would help the AI provide more personalized responses.
+              </p>
+              <textarea
+                value={personaInput}
+                onChange={(e) => setPersonaInput(e.target.value)}
+                placeholder="e.g., I'm a senior software engineer who prefers concise, technical answers. I enjoy hiking and photography."
+                className="w-full h-32 p-3 rounded-xl border bg-background outline-none focus:ring-2 focus:ring-primary/20 transition-all resize-none"
+              />
+            </div>
+            <div className="p-6 border-t flex justify-end gap-3">
+              <button
+                onClick={closePersonaModal}
+                className="px-4 py-2 text-sm font-medium hover:bg-accent rounded-lg transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={savePersona}
+                disabled={isLoading}
+                className="px-4 py-2 text-sm font-medium bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 disabled:opacity-50 transition-colors"
+              >
+                Save Persona
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

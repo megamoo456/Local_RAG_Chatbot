@@ -6,7 +6,9 @@ import httpx
 from typing import Optional
 from uuid import UUID
 from qdrant_client import QdrantClient
-from qdrant_client.models import Filter, SearchRequest
+from langchain_ollama import OllamaLLM
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
 
 from app.core.config import get_settings
 from app.services.api_service import api_service
@@ -25,6 +27,34 @@ class ChatService:
         )
         self.ollama_url = settings.ollama_base_url
         self.api_service = api_service
+        
+        # LangChain LLM initialization
+        self.llm = OllamaLLM(
+            model=self.ollama_model,
+            base_url=self.ollama_url,
+            temperature=settings.llm_temperature,
+        )
+        
+        # Ensure collection exists
+        self._ensure_collection_exists()
+
+    def _ensure_collection_exists(self):
+        """Ensure Qdrant collection exists, create if not."""
+        try:
+            self.qdrant_client.get_collection(settings.qdrant_collection_name)
+        except Exception:
+            # Collection doesn't exist, create it
+            try:
+                from qdrant_client.models import Distance, VectorParams
+                self.qdrant_client.create_collection(
+                    collection_name=settings.qdrant_collection_name,
+                    vectors_config=VectorParams(
+                        size=384,
+                        distance=Distance.COSINE,
+                    ),
+                )
+            except Exception as e:
+                print(f"Warning: Could not create Qdrant collection: {e}")
 
     @property
     def ollama_model(self) -> str:
@@ -44,34 +74,50 @@ class ChatService:
             List of retrieved document chunks with metadata
         """
         try:
+            # Ensure collection exists
+            self._ensure_collection_exists()
+            
             # Build filter for document IDs if provided
             query_filter = None
             if document_ids:
-                query_filter = Filter(
-                    must=[
+                query_filter = {
+                    "should": [
                         {"key": "document_id", "match": {"value": str(doc_id)}}
                         for doc_id in document_ids
                     ]
-                )
+                }
 
-            # Simple text search (in production, use embeddings)
-            search_results = self.qdrant_client.search(
+            # Scroll through all points with optional filter
+            search_results = self.qdrant_client.scroll(
                 collection_name=settings.qdrant_collection_name,
-                query_vector=None,  # Will use text search for now
-                query_filter=query_filter,
-                limit=top_k,
+                scroll_filter=query_filter,
+                limit=top_k * 3,  # Get more to allow for keyword filtering
                 with_payload=True,
                 with_vectors=False,
-                score_threshold=0.0,
             )
 
-            # Convert to dict format
+            # Filter by query text relevance (simple keyword matching)
+            points = search_results[0] if search_results else []
+            relevant_points = []
+            query_lower = query.lower()
+
+            for point in points:
+                text = point.payload.get("text", "").lower()
+                # Simple relevance score based on keyword matches
+                matches = sum(1 for word in query_lower.split() if word in text and len(word) > 2)
+                if matches > 0:
+                    relevant_points.append((point, matches))
+
+            # Sort by relevance and limit
+            relevant_points.sort(key=lambda x: x[1], reverse=True)
             contexts = []
-            for result in search_results:
+            
+            for point, score in relevant_points[:top_k]:
                 contexts.append({
-                    "text": result.payload.get("text", ""),
-                    "metadata": result.payload.get("metadata", {}),
-                    "score": result.score,
+                    "text": point.payload.get("text", ""),
+                    "metadata": point.payload.get("metadata", {}),
+                    "filename": point.payload.get("filename", ""),
+                    "score": score,
                 })
 
             return contexts
@@ -87,19 +133,42 @@ class ChatService:
         contexts: list[dict],
         conversation_id: str,
         use_internet: bool = False,
-    ) -> str:
+    ) -> tuple[str, str]:
         """
-        Generate response using Ollama.
-
-        Args:
-            message: User message
-            contexts: Retrieved document contexts
-            conversation_id: Conversation ID for tracking
-            use_internet: Whether to use internet search
+        Generate response using LangChain to capture thoughts.
 
         Returns:
-            Generated response text
+            Tuple of (final_response, thoughts)
         """
+        # Retrieve conversation memory
+        memory_text = ""
+        try:
+            from app.repositories.conversation_repository import ConversationRepository
+            repo = ConversationRepository()
+            session = await repo.get_session_by_id(conversation_id)
+            if session and session.user_memory:
+                memory_text = f"\nUser Memory/Preferences:\n{session.user_memory}\n"
+        except Exception as e:
+            print(f"Error retrieving memory: {e}")
+
+        # Retrieve user persona
+        persona_text = ""
+        try:
+            from app.repositories.conversation_repository import ConversationRepository
+            from app.models.user import User
+            repo = ConversationRepository()
+            session = await repo.get_session_by_id(conversation_id)
+            if session:
+                # Get user from session
+                user_repo = ConversationRepository()  # This is a simplification - in reality we'd have a user repo
+                # For now, we'll get the user through the session's user relationship
+                if session.user:
+                    persona = getattr(session.user, 'persona', None)
+                    if persona:
+                        persona_text = f"\nUser Persona:\n{persona}\n"
+        except Exception as e:
+            print(f"Error retrieving persona: {e}")
+
         # Build context string
         context_text = ""
         if contexts:
@@ -116,43 +185,77 @@ class ChatService:
                 for i, result in enumerate(search_results, 1):
                     internet_text += f"{i}. {result['title']}\n   URL: {result['url']}\n   {result['snippet']}\n"
 
-        # Build prompt
-        prompt = f"""You are a helpful AI assistant. Use the provided context to answer questions accurately.
+        # Chain of Thought Prompt
+        prompt_template = ChatPromptTemplate.from_template("""
+You are a helpful AI assistant. 
+First, think step-by-step about how to answer the user's request based on the provided context, user memory, and user persona. 
+Then, provide the final answer.
 
-{context_text}
-{internet_text}
+Format your response as follows:
+THOUGHTS:
+<your step-by-step reasoning>
+
+ANSWER:
+<your final response>
+
+{persona}
+{memory}
+{context}
+{internet}
 
 User: {message}
-Assistant:"""
+""")
+
+        chain = prompt_template | self.llm | StrOutputParser()
 
         try:
-            async with httpx.AsyncClient(timeout=settings.ollama_timeout) as client:
-                response = await client.post(
-                    f"{self.ollama_url}/api/generate",
-                    json={
-                        "model": self.ollama_model,
-                        "prompt": prompt,
-                        "stream": False,
-                        "options": {
-                            "temperature": settings.llm_temperature,
-                            "top_p": settings.llm_top_p,
-                            "num_predict": settings.llm_max_tokens,
-                        },
-                    },
-                )
+            full_response = chain.invoke({
+                "persona": persona_text,
+                "memory": memory_text,
+                "context": context_text,
+                "internet": internet_text,
+                "message": message
+            })
 
-                response.raise_for_status()
-                result = response.json()
-                return result.get("response", "I apologize, but I couldn't generate a response.")
+            # Split thoughts and answer
+            if "THOUGHTS:" in full_response and "ANSWER:" in full_response:
+                parts = full_response.split("ANSWER:")
+                thoughts = parts[0].replace("THOUGHTS:", "").strip()
+                answer = parts[1].strip()
+            else:
+                thoughts = "Direct response generated without explicit chain-of-thought."
+                answer = full_response
 
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 404:
-                return f"Model '{self.ollama_model}' not found. Please pull the model first: docker compose exec ollama ollama pull {self.ollama_model}"
-            print(f"Generation error: {e}")
-            return f"I encountered an error while generating a response: {str(e)}"
+            return answer, thoughts
+
         except Exception as e:
             print(f"Generation error: {e}")
-            return f"I encountered an error while generating a response: {str(e)}"
+            return f"I encountered an error while generating a response: {str(e)}", str(e)
+
+    async def refine_prompt(self, message: str) -> str:
+        """
+        Refine a user prompt using AI to make it more effective.
+        """
+        refine_template = ChatPromptTemplate.from_template("""
+You are an expert prompt engineer. Your task is to rewrite the user's prompt to be more clear, 
+specific, and effective for an LLM, while preserving the original intent.
+
+User Prompt: {message}
+
+Refined Prompt:
+""")
+        chain = refine_template | self.llm | StrOutputParser()
+        return chain.invoke({"message": message})
+
+    async def update_memory(self, conversation_id: str, memory_text: str) -> bool:
+        """
+        Update the persistent memory for a conversation.
+        """
+        # This is a simplified implementation. In a real app, we'd use a repository.
+        # For now, we'll assume the repository handles the DB update.
+        from app.repositories.conversation_repository import ConversationRepository
+        repo = ConversationRepository()
+        return await repo.update_session_memory(conversation_id, memory_text)
 
     async def chat(
         self,
@@ -161,30 +264,22 @@ Assistant:"""
         document_ids: Optional[list[UUID]] = None,
         use_rag: bool = True,
         use_internet: bool = False,
+        use_persona: bool = False,
     ) -> dict:
         """
         Process a chat message with optional RAG.
-
-        Args:
-            message: User message
-            conversation_id: Conversation ID
-            document_ids: Optional list of document IDs to use for RAG context
-            use_rag: Whether to use RAG for context
-            use_internet: Whether to use internet search
-
-        Returns:
-            Dictionary with response, sources, and metadata
         """
         # Retrieve context if RAG is enabled
         sources = []
         if use_rag:
             sources = await self.retrieve_context(message, top_k=settings.rag_rerank_top_k, document_ids=document_ids)
 
-        # Generate response
-        response = await self.generate_response(message, sources, conversation_id, use_internet)
+        # Generate response and thoughts
+        response, thoughts = await self.generate_response(message, sources, conversation_id, use_internet)
 
         return {
             "response": response,
+            "thoughts": thoughts,
             "sources": sources,
             "conversation_id": conversation_id,
             "model_used": self.ollama_model,
