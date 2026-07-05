@@ -116,7 +116,7 @@ def setup_middleware(app: FastAPI) -> None:
         status_code = _EXCEPTION_STATUS_MAP.get(
             type(exc), status.HTTP_500_INTERNAL_SERVER_ERROR
         )
-        return JSONResponse(
+        response = JSONResponse(
             status_code=status_code,
             content={
                 "error": exc.message,
@@ -124,12 +124,14 @@ def setup_middleware(app: FastAPI) -> None:
                 "status_code": status_code,
             },
         )
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        return response
 
     @app.exception_handler(Exception)
     async def unhandled_error_handler(request: Request, exc: Exception) -> JSONResponse:
         """Catch-all for unhandled exceptions — never leak stack traces to clients."""
         logger.exception("unhandled_exception", error=str(exc))
-        return JSONResponse(
+        response = JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content={
                 "error": "An internal error occurred",
@@ -137,3 +139,5 @@ def setup_middleware(app: FastAPI) -> None:
                 "status_code": 500,
             },
         )
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        return response

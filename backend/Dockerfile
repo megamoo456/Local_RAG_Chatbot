@@ -36,6 +36,8 @@ WORKDIR /app
 COPY pyproject.toml ./
 
 # Install dependencies (no dev deps in base)
+# We install torch CPU-only first to avoid massive GPU binaries and SSL timeouts
+RUN pip install torch --index-url https://download.pytorch.org/whl/cpu
 RUN poetry install --only main --no-root
 
 # ------------------------------------------------------------------------------

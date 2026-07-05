@@ -61,9 +61,23 @@ class ChatService:
         """Get current Ollama model from settings."""
         return get_settings().ollama_model
 
+    async def _get_ollama_embeddings(self, text: str) -> list[float]:
+        """
+        Fetch embedding for a single text from Ollama API.
+        """
+        url = f"{settings.ollama_base_url}/api/embed"
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                response = await client.post(url, json={"model": settings.embedding_model_name, "prompt": text})
+                response.raise_for_status()
+                return response.json().get("embedding", [])
+        except Exception as e:
+            print(f"Ollama embedding error: {e}")
+            return []
+
     async def retrieve_context(self, query: str, top_k: int = 5, document_ids: Optional[list[UUID]] = None) -> list[dict]:
         """
-        Retrieve relevant document chunks from Qdrant.
+        Retrieve relevant document chunks from Qdrant using semantic search.
 
         Args:
             query: User query to search for
@@ -77,7 +91,13 @@ class ChatService:
             # Ensure collection exists
             self._ensure_collection_exists()
             
-            # Build filter for document IDs if provided
+            # 1. Generate embedding for the query using Ollama
+            query_vector = await self._get_ollama_embeddings(query)
+            if not query_vector:
+                print("Failed to generate query embedding, falling back to empty context")
+                return []
+
+            # 2. Build filter for document IDs if provided
             query_filter = None
             if document_ids:
                 query_filter = {
@@ -87,43 +107,27 @@ class ChatService:
                     ]
                 }
 
-            # Scroll through all points with optional filter
-            search_results = self.qdrant_client.scroll(
+            # 3. Perform semantic search in Qdrant
+            search_results = self.qdrant_client.search(
                 collection_name=settings.qdrant_collection_name,
-                scroll_filter=query_filter,
-                limit=top_k * 3,  # Get more to allow for keyword filtering
+                query_vector=query_vector,
+                query_filter=query_filter,
+                limit=top_k,
                 with_payload=True,
-                with_vectors=False,
             )
 
-            # Filter by query text relevance (simple keyword matching)
-            points = search_results[0] if search_results else []
-            relevant_points = []
-            query_lower = query.lower()
-
-            for point in points:
-                text = point.payload.get("text", "").lower()
-                # Simple relevance score based on keyword matches
-                matches = sum(1 for word in query_lower.split() if word in text and len(word) > 2)
-                if matches > 0:
-                    relevant_points.append((point, matches))
-
-            # Sort by relevance and limit
-            relevant_points.sort(key=lambda x: x[1], reverse=True)
             contexts = []
-            
-            for point, score in relevant_points[:top_k]:
+            for point in search_results:
                 contexts.append({
                     "text": point.payload.get("text", ""),
                     "metadata": point.payload.get("metadata", {}),
                     "filename": point.payload.get("filename", ""),
-                    "score": score,
+                    "score": point.score,
                 })
 
             return contexts
 
         except Exception as e:
-            # If collection doesn't exist or search fails, return empty context
             print(f"Retrieval error: {e}")
             return []
 

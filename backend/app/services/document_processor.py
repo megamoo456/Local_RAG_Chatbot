@@ -8,6 +8,7 @@ from typing import Optional
 
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
+import httpx
 
 from app.core.config import get_settings
 
@@ -18,11 +19,12 @@ class DocumentProcessor:
     """Service for processing documents and indexing to Qdrant."""
 
     def __init__(self):
-        """Initialize Qdrant client."""
+        """Initialize Qdrant client and Embedding model."""
         self.qdrant_client = QdrantClient(
             host=settings.qdrant_host,
             port=settings.qdrant_port,
         )
+        
         self.chunk_size = settings.rag_chunk_size
         self.chunk_overlap = settings.rag_chunk_overlap
         # Ensure collection exists on initialization
@@ -184,6 +186,30 @@ class DocumentProcessor:
         """
         return hash(text) & 0x7FFFFFFF
 
+    def _get_ollama_embeddings(self, texts: list[str]) -> list[list[float]]:
+        """
+        Fetch embeddings from Ollama API.
+        """
+        url = f"{settings.ollama_host}/api/embed"
+        payload = {
+            "model": settings.embedding_model_name,
+            "prompt": texts
+        }
+        
+        # Ollama's /api/embed usually takes a single prompt. 
+        # For batching, we iterate or use a loop if the API doesn't support list of prompts.
+        # Most Ollama versions expect one prompt per request for /api/embed.
+        
+        all_embeddings = []
+        with httpx.Client(timeout=60.0) as client:
+            for text in texts:
+                response = client.post(url, json={"model": settings.embedding_model_name, "prompt": text})
+                response.raise_for_status()
+                embedding = response.json().get("embedding")
+                all_embeddings.append(embedding)
+        
+        return all_embeddings
+
     def process_document(
         self,
         document_id: uuid.UUID,
@@ -219,14 +245,17 @@ class DocumentProcessor:
             # Ensure collection exists
             self._ensure_collection_exists()
 
+            # Generate embeddings using Ollama instead of local model
+            embeddings = self._get_ollama_embeddings(chunks)
+
             # Index chunks to Qdrant
             points = []
-            for i, chunk in enumerate(chunks):
+            for i, (chunk, vector) in enumerate(zip(chunks, embeddings)):
                 point_id = self._simple_hash(f"{document_id}_{i}_{chunk[:50]}")
                 points.append(
                     PointStruct(
                         id=point_id,
-                        vector=[0.0] * 384,  # Dummy vector for text-based search
+                        vector=vector.tolist(),
                         payload={
                             "document_id": str(document_id),
                             "chunk_index": i,
